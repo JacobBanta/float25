@@ -1,179 +1,207 @@
 #include <SPI.h>
-#include <nRF24L01.h>
 #include <RF24.h>
 
-RF24 radio(7, 8); // CE, CSN pins
-const byte address[6] = "00001";
+// NRF24L01 pins
+#define CE_PIN 7
+#define CSN_PIN 8
 
-struct DataPacket {
-  char type; // 'P' for pressure, 'C' for command, 'R' for request, 'A' for ack, 'S' for start, 'M' for param
-  float pressure;
-  uint16_t sequence;
-  char command;
-  char param_name[16];
-  float param_value;
+// Radio setup
+RF24 radio(CE_PIN, CSN_PIN);
+const byte addresses[][6] = {"00001", "00002"};
+
+// Packet tracking
+struct PacketTracker {
+  int lastSequence;
+  unsigned long lastReceived;
+  bool waitingForAck[100]; // Track last 100 packets
 };
 
-uint16_t expected_sequence = 0;
-uint16_t last_received_sequence = 0;
-unsigned long last_packet_time = 0;
-const unsigned long PACKET_TIMEOUT = 10000;
+PacketTracker tracker = {0, 0, {false}};
+
+// User interface
+String inputString = "";
+bool stringComplete = false;
 
 void setup() {
   Serial.begin(9600);
-  radio.begin();
-  radio.openWritingPipe(address);
-  radio.openReadingPipe(1, address);
-  radio.setPALevel(RF24_PA_MIN);
-  radio.startListening();
   
-  Serial.println("A1 Ready - Enhanced Control System");
-  Serial.println("Commands:");
-  Serial.println("  0/1 - GPIO control");
-  Serial.println("  START - Begin depth control sequence");
-  Serial.println("  SET <param> <value> - Set parameter");
-  Serial.println("    depth_trigger <mbar>");
-  Serial.println("    max_depth <mbar>");
-  Serial.println("    stability_threshold <mbar>");
-  Serial.println("    stability_duration <seconds>");
+  // Initialize radio
+  radio.begin();
+  radio.openWritingPipe(addresses[1]);     // To A2
+  radio.openReadingPipe(1, addresses[0]);  // From A2
+  radio.setPALevel(RF24_PA_HIGH);
+  radio.setRetries(15, 15);
+  radio.startListening();
+  radio.setPayloadSize(256);
+  
+  //Serial.println("A1 Controller initialized");
+  //Serial.println("Commands:");
+  //Serial.println("  START - Begin depth control");
+  //Serial.println("  0 <pin> - Set GPIO pin LOW");
+  //Serial.println("  1 <pin> - Set GPIO pin HIGH");
+  //Serial.println("  SET <param> <value> - Update parameter");
+  //Serial.println("  MONITOR - Show packet status");
 }
 
 void loop() {
-  // Check for user input
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    
-    if (input == "0" || input == "1") {
-      send_gpio_command(input.charAt(0));
-    }
-    else if (input == "START") {
-      send_start_command();
-    }
-    else if (input.startsWith("SET ")) {
-      handle_parameter_command(input);
-    }
+  serialEvent();
+  // Handle incoming serial commands
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
   }
   
-  // Check for incoming pressure data
-  if (radio.available()) {
-    DataPacket packet;
-    radio.read(&packet, sizeof(packet));
-    
-    if (packet.type == 'P') {
-      handle_pressure_packet(packet);
-    }
-  }
+  // Handle incoming radio messages
+  handleRadioMessages();
   
-  // Check for timeout
-  if (millis() - last_packet_time > PACKET_TIMEOUT && last_packet_time > 0) {
-    Serial.println("Packet timeout - requesting latest data");
-    request_packet(expected_sequence);
-    last_packet_time = millis();
-  }
+  // Check for missing packets
+  checkMissingPackets();
   
   delay(10);
 }
 
-void send_gpio_command(char command) {
-  DataPacket packet;
-  packet.type = 'C';
-  packet.command = command;
-  packet.sequence = 0;
-  
-  radio.stopListening();
-  radio.write(&packet, sizeof(packet));
-  radio.startListening();
-  
-  Serial.print("Sent GPIO command: ");
-  Serial.println(command);
-}
-
-void send_start_command() {
-  DataPacket packet;
-  packet.type = 'S';
-  packet.sequence = 0;
-  
-  radio.stopListening();
-  radio.write(&packet, sizeof(packet));
-  radio.startListening();
-  
-  Serial.println("Sent START command - Beginning depth control sequence");
-}
-
-void handle_parameter_command(String input) {
-  // Parse "SET param_name value"
-  int first_space = input.indexOf(' ');
-  int second_space = input.indexOf(' ', first_space + 1);
-  
-  if (first_space != -1 && second_space != -1) {
-    String param_name = input.substring(first_space + 1, second_space);
-    float param_value = input.substring(second_space + 1).toFloat();
+void serialEvent() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
     
-    DataPacket packet;
-    packet.type = 'M';
-    packet.param_value = param_value;
-    packet.sequence = 0;
-    
-    // Copy parameter name (truncate if too long)
-    param_name.toCharArray(packet.param_name, sizeof(packet.param_name));
-    
-    radio.stopListening();
-    radio.write(&packet, sizeof(packet));
-    radio.startListening();
-    
-    Serial.print("Set parameter ");
-    Serial.print(param_name);
-    Serial.print(" = ");
-    Serial.println(param_value);
-  } else {
-    Serial.println("Invalid format. Use: SET <param_name> <value>");
-  }
-}
-
-void handle_pressure_packet(DataPacket packet) {
-  last_packet_time = millis();
-  
-  // Check for missing packets
-  if (packet.sequence != expected_sequence && expected_sequence > 0) {
-    Serial.print("MISSING PACKETS! Expected: ");
-    Serial.print(expected_sequence);
-    Serial.print(", Received: ");
-    Serial.println(packet.sequence);
-    
-    for (uint16_t missing = expected_sequence; missing < packet.sequence; missing++) {
-      request_packet(missing);
-      delay(50);
+    if (inChar == '\n' || inChar == '\r') {
+      stringComplete = true;
+    } else {
+      Serial.println(inChar, HEX);
+      inputString += inChar;
     }
   }
-  
-  send_ack(packet.sequence);
-  
-  Serial.print("Pressure: ");
-  Serial.print(packet.pressure);
-  Serial.print(" mbar, Sequence: ");
-  Serial.println(packet.sequence);
-  
-  expected_sequence = packet.sequence + 1;
-  last_received_sequence = packet.sequence;
 }
 
-void request_packet(uint16_t sequence) {
-  DataPacket request;
-  request.type = 'R';
-  request.sequence = sequence;
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
   
+  if (command == "START") {
+    sendCommand("START");
+    Serial.println("INFO: Sent START command");
+    
+  } else if (command.startsWith("SET ")) {
+    sendCommand(command.c_str());
+    Serial.println("INFO: Sent parameter update: " + command);
+    
+  } else if (command.length() >= 3 && (command.startsWith("0 ") || command.startsWith("1 "))) {
+    sendCommand(command.c_str());
+    Serial.println("INFO: Sent GPIO command: " + command);
+    
+  } else if (command == "MONITOR") {
+    showPacketStatus();
+    
+  } else {
+    Serial.println("INFO: Unknown command: " + command);
+  }
+}
+
+void sendCommand(const char* command) {
   radio.stopListening();
-  radio.write(&request, sizeof(request));
+  
+  bool result = radio.write(command, strlen(command) + 1);
+  
+  if (result) {
+    Serial.println("INFO: Command sent successfully");
+  } else {
+    Serial.println("INFO: Failed to send command");
+  }
+  
   radio.startListening();
 }
 
-void send_ack(uint16_t sequence) {
-  DataPacket ack;
-  ack.type = 'A';
-  ack.sequence = sequence;
+void handleRadioMessages() {
+  char buffer[256] = {0};
+  
+  if (radio.available()) {
+    radio.read(buffer, sizeof(buffer));
+    
+    if (strncmp(buffer, "PRESSURE:", 9) == 0) {
+      processPressureReading(buffer);
+    } else if (strncmp(buffer, "ACK:", 4) == 0) {
+      processAcknowledgment(buffer);
+    } else {
+      Serial.println("INFO: received " + String(buffer));
+    }
+  }
+}
+
+void processPressureReading(const char* message) {
+  int sequence;
+  float pressure;
+  
+  if (sscanf(message, "PRESSURE:%d:%f", &sequence, &pressure) == 2) {
+    Serial.print("Pressure: ");
+    Serial.print(pressure, 2);
+    Serial.print(" mbar (seq: ");
+    Serial.print(sequence);
+    Serial.println(")");
+    
+    tracker.lastSequence = sequence;
+    tracker.lastReceived = millis();
+    
+    // Mark as received
+    if (sequence < 100) {
+      tracker.waitingForAck[sequence % 100] = true;
+    }
+  }
+}
+
+void processAcknowledgment(const char* message) {
+  int sequence;
+  
+  if (sscanf(message, "ACK:PRESSURE:%d", &sequence) == 1) {
+    // Mark as acknowledged
+    if (sequence < 100) {
+      tracker.waitingForAck[sequence % 100] = false;
+    }
+  }
+}
+
+void checkMissingPackets() {
+  static unsigned long lastCheck = 0;
+  
+  if (millis() - lastCheck > 30000) { // Check every 30 seconds
+    lastCheck = millis();
+    
+    // Check for missing packets in last 100
+    for (int i = 0; i < 100; i++) {
+      if (tracker.waitingForAck[i]) {
+        Serial.print("INFO: Missing packet: ");
+        Serial.println(i);
+        requestRetransmission(i);
+      }
+    }
+  }
+}
+
+void requestRetransmission(int sequence) {
+  char request[32];
+  snprintf(request, sizeof(request), "RETRANSMIT:%d", sequence);
   
   radio.stopListening();
-  radio.write(&ack, sizeof(ack));
+  radio.write(request, strlen(request) + 1);
   radio.startListening();
+  
+  Serial.print("INFO: Requested retransmission of packet ");
+  Serial.println(sequence);
+}
+
+void showPacketStatus() {
+  Serial.println("=== Packet Status ===");
+  Serial.print("Last sequence: ");
+  Serial.println(tracker.lastSequence);
+  Serial.print("Last received: ");
+  Serial.print((millis() - tracker.lastReceived) / 1000);
+  Serial.println(" seconds ago");
+  
+  int missing = 0;
+  for (int i = 0; i < 100; i++) {
+    if (tracker.waitingForAck[i]) missing++;
+  }
+  Serial.print("Missing packets: ");
+  Serial.println(missing);
+  Serial.println("====================");
 }

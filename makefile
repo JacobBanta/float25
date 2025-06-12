@@ -1,4 +1,4 @@
-.PHONY: build clean flash-surface flash-onboard
+.PHONY: build clean flash-surface flash-onboard upload-pi
 build: surface/build/arduino.avr.nano/surface.ino.hex onboard/build/arduino.avr.nano/onboard.ino.hex
 
 surface/build/arduino.avr.nano/surface.ino.hex: surface/surface.ino
@@ -13,3 +13,7 @@ flash-onboard: onboard/build/arduino.avr.nano/onboard.ino.hex
 clean: build
 	rm -r surface/build
 	rm -r onboard/build
+upload-pi: float.py
+	sudo mount --target /mnt/rpi /dev/sda2
+	cp ./float.py /mnt/rpi/home/raspcpu/float.py
+	sudo umount /mnt/rpi

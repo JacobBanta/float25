@@ -1,308 +1,221 @@
 #!/usr/bin/env python3
-import serial
-import time
-import threading
-from datetime import datetime
-from enum import Enum
-from collections import deque
 import RPi.GPIO as GPIO
+import serial
+import threading
+import time
+import json
+import logging
+from enum import Enum
+from dataclasses import dataclass
+from typing import Dict, Any
 
-class DepthControlState(Enum):
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class DepthState(Enum):
     IDLE = "idle"
     DESCENDING = "descending"
-    AT_TRIGGER_DEPTH = "at_trigger_depth"
-    WAITING_45_SEC = "waiting_45_sec"
+    AT_DEPTH = "at_depth"
     OSCILLATING_DOWN = "oscillating_down"
     OSCILLATING_UP = "oscillating_up"
 
-class PressureSensorSystem:
-    def __init__(self, buffer_size=100):
-        # GPIO setup for control pins
+@dataclass
+class SystemParameters:
+    depth_trigger: float = 1500.0  # mbar
+    max_depth: float = 2000.0      # mbar
+    stability_threshold: float = 50.0  # mbar
+    stability_duration: int = 10   # seconds
+
+class DepthController:
+    def __init__(self):
+        # GPIO setup
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(5, GPIO.OUT)
         GPIO.setup(6, GPIO.OUT)
         
-        # Start with both pins HIGH
+        # Initialize GPIO pins HIGH
         GPIO.output(5, GPIO.HIGH)
         GPIO.output(6, GPIO.HIGH)
         
-        # Hardware UART setup - Pi GPIO 14 (TX) and 15 (RX)
-        uart_devices = ['/dev/serial0', '/dev/ttyAMA0', '/dev/ttyS0']
-        self.uart = None
+        # UART setup
+        self.uart = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
         
-        for device in uart_devices:
+        # System state
+        self.state = DepthState.IDLE
+        self.parameters = SystemParameters()
+        self.current_depth = 0.0
+        self.sequence_number = 0
+        self.running = True
+        self.depth_control_active = False
+        
+        # Stability tracking
+        self.stable_start_time = None
+        self.at_depth_start_time = None
+        
+        # Thread locks
+        self.state_lock = threading.Lock()
+        self.param_lock = threading.Lock()
+        
+    def start(self):
+        """Start the system threads"""
+        # Start communication thread
+        comm_thread = threading.Thread(target=self._communication_handler, daemon=True)
+        comm_thread.start()
+        
+        # Start depth control thread
+        depth_thread = threading.Thread(target=self._depth_control_loop, daemon=True)
+        depth_thread.start()
+        
+        logger.info("System started - GPIO 5 and 6 HIGH, waiting for START command")
+        
+    def _communication_handler(self):
+        """Handle UART communication with A2"""
+        while self.running:
             try:
-                self.uart = serial.Serial(device, 9600, timeout=0.5)
-                self.uart.reset_input_buffer()
-                self.uart.reset_output_buffer()
-                print(f"Connected to UART on {device}")
-                break
+                if self.uart.in_waiting > 0:
+                    line = self.uart.readline().decode('utf-8').strip()
+                    if line:
+                        self._process_command(line)
             except Exception as e:
-                print(f"Failed to connect to {device}: {e}")
-        
-        if self.uart is None:
-            print("ERROR: Could not connect to any UART device")
-            print("Make sure UART is enabled: sudo raspi-config -> Interface Options -> Serial")
-            exit(1)
-        
-        # Data buffer
-        self.buffer_size = buffer_size
-        self.data_buffer = {}
-        self.sequence_counter = 0
-        self.acknowledged_sequences = set()
-        self.buffer_lock = threading.Lock()
-        
-        # Depth control parameters
-        self.params = {
-            'depth_trigger': 1050.0,
-            'max_depth': 1100.0,
-            'stability_threshold': 2.0,
-            'stability_duration': 10.0
-        }
-        
-        # State machine variables
-        self.state = DepthControlState.IDLE
-        self.pressure_history = deque(maxlen=20)
-        self.state_start_time = time.time()
-        self.last_pressure = 0
-        
-        print("Pi system initialized with hardware UART")
-        print("Wiring: Pi GPIO 14 (Pin 8) -> A2 Pin 1 (RX)")
-        print("        Pi GPIO 15 (Pin 10) -> A2 Pin 0 (TX)")
-        print("        Pi Ground -> A2 Ground")
-        print(f"GPIO pins 5,6 set HIGH (idle state)")
+                logger.error(f"Communication error: {e}")
+            time.sleep(0.1)
     
-    def read_bar30_pressure(self):
-        """Simulate BAR30 pressure sensor reading"""
-        import random
-        base_pressure = 1013.25
-        if hasattr(self, 'simulated_depth'):
-            self.simulated_depth += random.uniform(-1, 2)
-        else:
-            self.simulated_depth = random.uniform(0, 10)
-        
-        return base_pressure + self.simulated_depth
-    
-    def update_parameters(self, param_name, value):
-        """Update system parameters"""
-        if param_name in self.params:
-            old_value = self.params[param_name]
-            self.params[param_name] = value
-            print(f"Updated {param_name}: {old_value} -> {value}")
-        else:
-            print(f"Unknown parameter: {param_name}")
-    
-    def set_gpio_state(self, pin5_state, pin6_state, description=""):
-        """Set GPIO pins and log the change"""
-        GPIO.output(5, pin5_state)
-        GPIO.output(6, pin6_state)
-        pin5_str = "HIGH" if pin5_state else "LOW"
-        pin6_str = "HIGH" if pin6_state else "LOW"
-        print(f"GPIO: Pin 5={pin5_str}, Pin 6={pin6_str} {description}")
-    
-    def is_pressure_stable(self):
-        """Check if pressure has been stable"""
-        if len(self.pressure_history) < 3:
-            return False
-        
-        recent_pressures = list(self.pressure_history)[-int(self.params['stability_duration']):]
-        if len(recent_pressures) < self.params['stability_duration']:
-            return False
-        
-        max_pressure = max(recent_pressures)
-        min_pressure = min(recent_pressures)
-        
-        return (max_pressure - min_pressure) <= self.params['stability_threshold']
-    
-    def update_depth_control_state(self, current_pressure):
-        """State machine for depth control"""
-        current_time = time.time()
-        time_in_state = current_time - self.state_start_time
-        
-        self.pressure_history.append(current_pressure)
-        
-        if self.state == DepthControlState.IDLE:
-            pass
-        elif self.state == DepthControlState.DESCENDING:
-            if current_pressure >= self.params['depth_trigger']:
-                self.state = DepthControlState.AT_TRIGGER_DEPTH
-                self.state_start_time = current_time
-                self.set_gpio_state(GPIO.HIGH, GPIO.HIGH, "(reached trigger depth)")
-        elif self.state == DepthControlState.AT_TRIGGER_DEPTH:
-            if current_pressure >= self.params['max_depth']:
-                self.state = DepthControlState.WAITING_45_SEC
-                self.state_start_time = current_time
-                print("Reached max depth - starting 45 second timer")
-        elif self.state == DepthControlState.WAITING_45_SEC:
-            if time_in_state >= 45:
-                self.state = DepthControlState.OSCILLATING_DOWN
-                self.state_start_time = current_time
-                self.set_gpio_state(GPIO.HIGH, GPIO.LOW, "(starting oscillation)")
-        elif self.state == DepthControlState.OSCILLATING_DOWN:
-            if self.is_pressure_stable():
-                self.state = DepthControlState.OSCILLATING_UP
-                self.state_start_time = current_time
-                self.set_gpio_state(GPIO.LOW, GPIO.HIGH, "(reversing)")
-        elif self.state == DepthControlState.OSCILLATING_UP:
-            if self.is_pressure_stable():
-                self.state = DepthControlState.WAITING_45_SEC
-                self.state_start_time = current_time
-                self.set_gpio_state(GPIO.HIGH, GPIO.HIGH, "(stable)")
-        
-        self.last_pressure = current_pressure
-    
-    def start_depth_control(self):
-        """Begin the depth control sequence"""
-        print("Starting depth control sequence!")
-        self.state = DepthControlState.DESCENDING
-        self.state_start_time = time.time()
-        self.pressure_history.clear()
-        self.set_gpio_state(GPIO.HIGH, GPIO.LOW, "(starting descent)")
-    
-    def safe_uart_write(self, message):
-        """Safely write to UART"""
+    def _process_command(self, command: str):
+        """Process incoming commands from A2"""
         try:
-            if not message.endswith('\n'):
-                message += '\n'
+            parts = command.split()
+            cmd = parts[0].upper()
             
-            self.uart.write(message.encode('ascii'))
-            self.uart.flush()
-            return True
-        except Exception as e:
-            print(f"UART write error: {e}")
-            return False
-    
-    def pressure_reader_thread(self):
-        """Thread to read pressure sensor every 5 seconds"""
-        while True:
-            try:
-                pressure = self.read_bar30_pressure()
-                self.update_depth_control_state(pressure)
+            if cmd == "START":
+                with self.state_lock:
+                    self.depth_control_active = True
+                    self.state = DepthState.DESCENDING
+                logger.info("START command received - beginning depth control")
                 
-                reading = {
-                    'pressure': pressure,
-                    'timestamp': datetime.now().isoformat(),
-                    'sequence': self.sequence_counter,
-                    'state': self.state.value
-                }
+            elif cmd == "SET" and len(parts) >= 3:
+                param_name = parts[1]
+                param_value = float(parts[2])
+                self._update_parameter(param_name, param_value)
                 
-                with self.buffer_lock:
-                    self.data_buffer[self.sequence_counter] = reading
+            elif cmd in ["0", "1"] and len(parts) >= 2:
+                pin_num = int(parts[1])
+                if pin_num in [5, 6]:
+                    value = GPIO.HIGH if cmd == "1" else GPIO.LOW
+                    GPIO.output(pin_num, value)
+                    logger.info(f"Manual GPIO {pin_num} set to {cmd}")
                     
-                    if len(self.data_buffer) > self.buffer_size:
-                        oldest_sequences = sorted(self.data_buffer.keys())
-                        for seq in oldest_sequences:
-                            if seq in self.acknowledged_sequences:
-                                del self.data_buffer[seq]
-                                self.acknowledged_sequences.discard(seq)
-                                break
+        except Exception as e:
+            logger.error(f"Command processing error: {e}")
+    
+    def _update_parameter(self, param_name: str, value: float):
+        """Update system parameters"""
+        with self.param_lock:
+            if hasattr(self.parameters, param_name):
+                setattr(self.parameters, param_name, value)
+                logger.info(f"Parameter {param_name} updated to {value}")
+            else:
+                logger.warning(f"Unknown parameter: {param_name}")
+    
+    def _simulate_depth_sensor(self) -> float:
+        """Simulate depth sensor reading"""
+        # Simple simulation - replace with actual sensor code
+        import random
+        base_depth = 1000 + (time.time() % 100) * 10
+        noise = random.uniform(-20, 20)
+        return base_depth + noise
+    
+    def _depth_control_loop(self):
+        """Main depth control state machine"""
+        while self.running:
+            if not self.depth_control_active:
+                time.sleep(1)
+                continue
                 
-                # Send to A2
-                message = f"PRESSURE:{pressure:.2f}:{self.sequence_counter}"
-                if self.safe_uart_write(message):
-                    print(f"Sent: P={pressure:.2f}, State={self.state.value}, Seq={self.sequence_counter}")
-                
-                self.sequence_counter += 1
-                
-            except Exception as e:
-                print(f"Error in pressure reading: {e}")
+            # Read depth sensor every 5 seconds
+            self.current_depth = self._simulate_depth_sensor()
+            self._send_pressure_reading()
+            
+            with self.state_lock:
+                self._update_state_machine()
             
             time.sleep(5)
     
-    def uart_listener_thread(self):
-        """Thread to listen for UART commands"""
-        buffer = b''
-        
-        while True:
-            try:
-                if self.uart.in_waiting > 0:
-                    new_data = self.uart.read(self.uart.in_waiting)
-                    buffer += new_data
-                    
-                    while b'\n' in buffer:
-                        line_bytes, buffer = buffer.split(b'\n', 1)
-                        
-                        try:
-                            line = line_bytes.decode('ascii').strip()
-                            if line:
-                                print(f"Received from A2: '{line}'")
-                                self.process_command(line)
-                        except UnicodeDecodeError:
-                            print(f"Invalid bytes: {[hex(b) for b in line_bytes]}")
-                        
-            except Exception as e:
-                print(f"UART listener error: {e}")
-                buffer = b''
+    def _update_state_machine(self):
+        """Update the depth control state machine"""
+        if self.state == DepthState.DESCENDING:
+            GPIO.output(5, GPIO.HIGH)
+            GPIO.output(6, GPIO.LOW)
             
-            time.sleep(0.1)
+            if self.current_depth >= self.parameters.depth_trigger:
+                self.state = DepthState.AT_DEPTH
+                self.at_depth_start_time = time.time()
+                logger.info("Reached depth trigger - both pins HIGH")
+                
+        elif self.state == DepthState.AT_DEPTH:
+            GPIO.output(5, GPIO.HIGH)
+            GPIO.output(6, GPIO.HIGH)
+            
+            if self.current_depth >= self.parameters.max_depth:
+                if self.at_depth_start_time is None:
+                    self.at_depth_start_time = time.time()
+                elif time.time() - self.at_depth_start_time >= 45:
+                    self.state = DepthState.OSCILLATING_DOWN
+                    self.at_depth_start_time = None
+                    logger.info("Max depth timeout - starting oscillation")
+                    
+        elif self.state == DepthState.OSCILLATING_DOWN:
+            GPIO.output(5, GPIO.HIGH)
+            GPIO.output(6, GPIO.LOW)
+            
+            if self._is_depth_stable():
+                self.state = DepthState.OSCILLATING_UP
+                logger.info("Depth stable - switching to oscillating up")
+                
+        elif self.state == DepthState.OSCILLATING_UP:
+            GPIO.output(5, GPIO.LOW)
+            GPIO.output(6, GPIO.HIGH)
+            
+            if not self._is_depth_stable():
+                self.state = DepthState.OSCILLATING_DOWN
+                self.stable_start_time = None
+                logger.info("Depth unstable - switching to oscillating down")
     
-    def process_command(self, line):
-        """Process received command"""
+    def _is_depth_stable(self) -> bool:
+        """Check if depth is stable within threshold"""
+        # Simplified stability check - in real implementation, 
+        # you'd want to track depth history
+        if abs(self.current_depth - self.parameters.max_depth) <= self.parameters.stability_threshold:
+            if self.stable_start_time is None:
+                self.stable_start_time = time.time()
+            return (time.time() - self.stable_start_time) >= self.parameters.stability_duration
+        else:
+            self.stable_start_time = None
+            return False
+    
+    def _send_pressure_reading(self):
+        """Send pressure reading to A2"""
         try:
-            if line.startswith("CMD:") and len(line) >= 5:
-                command = line[4]
-                self.handle_gpio_command(command)
-            elif line == "START":
-                self.start_depth_control()
-            elif line.startswith("PARAM:"):
-                parts = line.split(':')
-                if len(parts) == 3:
-                    param_name = parts[1]
-                    param_value = float(parts[2])
-                    self.update_parameters(param_name, param_value)
-            elif line.startswith("ACK:"):
-                sequence = int(line[4:])
-                self.handle_acknowledgment(sequence)
-            elif line.startswith("REQ:"):
-                sequence = int(line[4:])
-                self.handle_retransmission_request(sequence)
-            elif line == "A2_READY" or line.startswith("A2_"):
-                print(f"A2 status: {line}")
+            self.sequence_number += 1
+            message = f"PRESSURE:{self.sequence_number}:{self.current_depth:.2f}\n"
+            self.uart.write(message.encode('utf-8'))
+            logger.debug(f"Sent pressure reading: {self.current_depth:.2f} mbar")
         except Exception as e:
-            print(f"Error processing command '{line}': {e}")
+            logger.error(f"Failed to send pressure reading: {e}")
     
-    def handle_gpio_command(self, command):
-        """Handle GPIO commands"""
-        if self.state != DepthControlState.IDLE:
-            print(f"GPIO command '{command}' ignored - system in {self.state.value} state")
-            return
-        
-        if command == '0':
-            self.set_gpio_state(GPIO.LOW, GPIO.LOW, "(manual)")
-        elif command == '1':
-            self.set_gpio_state(GPIO.HIGH, GPIO.HIGH, "(manual)")
-    
-    def handle_acknowledgment(self, sequence):
-        """Handle acknowledgment"""
-        with self.buffer_lock:
-            self.acknowledged_sequences.add(sequence)
-    
-    def handle_retransmission_request(self, sequence):
-        """Handle retransmission request"""
-        with self.buffer_lock:
-            if sequence in self.data_buffer:
-                reading = self.data_buffer[sequence]
-                message = f"PRESSURE:{reading['pressure']:.2f}:{sequence}"
-                self.safe_uart_write(message)
-    
-    def run(self):
-        """Start system"""
-        pressure_thread = threading.Thread(target=self.pressure_reader_thread, daemon=True)
-        pressure_thread.start()
-        
-        uart_thread = threading.Thread(target=self.uart_listener_thread, daemon=True)
-        uart_thread.start()
-        
-        print("System running with hardware UART...")
-        
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("Shutting down...")
-            GPIO.cleanup()
-            self.uart.close()
+    def cleanup(self):
+        """Cleanup resources"""
+        self.running = False
+        GPIO.cleanup()
+        self.uart.close()
 
 if __name__ == "__main__":
-    system = PressureSensorSystem(buffer_size=200)
-    system.run()
+    controller = DepthController()
+    try:
+        controller.start()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        controller.cleanup()
