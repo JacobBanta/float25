@@ -1,221 +1,291 @@
 #!/usr/bin/env python3
-import RPi.GPIO as GPIO
-import serial
-import threading
+"""
+Bar30 Depth Sensor Reader with Arduino Communication and GPIO Control
+Reads from Bar30 sensor, communicates with Arduino, and controls GPIO pins
+"""
+
 import time
-import json
-import logging
-from enum import Enum
-from dataclasses import dataclass
-from typing import Dict, Any
+import ms5837
+import serial
+import sys
+import RPi.GPIO as GPIO
+from threading import Thread
+import queue
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Configuration
+ARDUINO_PORT = "/dev/ttyUSB0"
+ARDUINO_BAUD = 9600
+DEPTH_SEND_INTERVAL = 5.0  # Send depth every 5 seconds
+SENSOR_READ_INTERVAL = 0.1  # Read sensor every 100ms
 
-class DepthState(Enum):
-    IDLE = "idle"
-    DESCENDING = "descending"
-    AT_DEPTH = "at_depth"
-    OSCILLATING_DOWN = "oscillating_down"
-    OSCILLATING_UP = "oscillating_up"
+# GPIO Pin Configuration
+GPIO_PIN_5 = 5
+GPIO_PIN_6 = 6
 
-@dataclass
-class SystemParameters:
-    depth_trigger: float = 1500.0  # mbar
-    max_depth: float = 2000.0      # mbar
-    stability_threshold: float = 50.0  # mbar
-    stability_duration: int = 10   # seconds
-
-class DepthController:
+class DepthSensorController:
     def __init__(self):
-        # GPIO setup
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(5, GPIO.OUT)
-        GPIO.setup(6, GPIO.OUT)
-        
-        # Initialize GPIO pins HIGH
-        GPIO.output(5, GPIO.HIGH)
-        GPIO.output(6, GPIO.HIGH)
-        
-        # UART setup
-        self.uart = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
-        
-        # System state
-        self.state = DepthState.IDLE
-        self.parameters = SystemParameters()
+        self.sensor = None
+        self.arduino = None
         self.current_depth = 0.0
-        self.sequence_number = 0
-        self.running = True
-        self.depth_control_active = False
+        self.last_depth_send_time = 0
+        self.gpio_state = {"pin5": True, "pin6": True}
+        self.state = "DESCEND"
+        self.time = time.time()
         
-        # Stability tracking
-        self.stable_start_time = None
-        self.at_depth_start_time = None
+        # Setup GPIO
+        self.setup_gpio()
         
-        # Thread locks
-        self.state_lock = threading.Lock()
-        self.param_lock = threading.Lock()
+        # Setup sensor
+        self.setup_sensor()
         
-    def start(self):
-        """Start the system threads"""
-        # Start communication thread
-        comm_thread = threading.Thread(target=self._communication_handler, daemon=True)
-        comm_thread.start()
-        
-        # Start depth control thread
-        depth_thread = threading.Thread(target=self._depth_control_loop, daemon=True)
-        depth_thread.start()
-        
-        logger.info("System started - GPIO 5 and 6 HIGH, waiting for START command")
-        
-    def _communication_handler(self):
-        """Handle UART communication with A2"""
-        while self.running:
-            try:
-                if self.uart.in_waiting > 0:
-                    line = self.uart.readline().decode('utf-8').strip()
-                    if line:
-                        self._process_command(line)
-            except Exception as e:
-                logger.error(f"Communication error: {e}")
-            time.sleep(0.1)
+        # Setup Arduino communication
+        self.setup_arduino()
     
-    def _process_command(self, command: str):
-        """Process incoming commands from A2"""
+    def setup_gpio(self):
+        """Initialize GPIO pins"""
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        
+        # Setup output pins
+        GPIO.setup(GPIO_PIN_5, GPIO.OUT)
+        GPIO.setup(GPIO_PIN_6, GPIO.OUT)
+        
+        # Initialize pins to HIGH
+        GPIO.output(GPIO_PIN_5, GPIO.HIGH)
+        GPIO.output(GPIO_PIN_6, GPIO.HIGH)
+        
+        print("GPIO pins initialized")
+    
+    def setup_sensor(self):
+        """Initialize the Bar30 depth sensor"""
+        self.sensor = ms5837.MS5837_30BA()
+        
+        if not self.sensor.init():
+            print("Failed to initialize MS5837 sensor!")
+            print("Check I2C wiring:")
+            print("  VCC -> 3.3V, GND -> Ground")
+            print("  SDA -> GPIO 2, SCL -> GPIO 3")
+            sys.exit(1)
+        
+        # Set fluid density (1025 for saltwater, 997 for freshwater)
+        self.sensor.setFluidDensity(1025)  # Saltwater
+        print("Bar30 sensor initialized successfully!")
+    
+    def setup_arduino(self):
+        """Initialize Arduino serial communication"""
         try:
-            parts = command.split()
-            cmd = parts[0].upper()
+            self.arduino = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+            time.sleep(2)  # Allow Arduino to reset
+            print(f"Arduino connected on {ARDUINO_PORT}")
             
-            if cmd == "START":
-                with self.state_lock:
-                    self.depth_control_active = True
-                    self.state = DepthState.DESCENDING
-                logger.info("START command received - beginning depth control")
+            # Wait for START signal from Arduino
+            print("Waiting for START signal from Arduino...")
+            while True:
+                if self.arduino.in_waiting > 0:
+                    message = self.arduino.readline().decode().strip()
+                    print(f"Received from Arduino: {message}")
+                    if message == "START":
+                        print("START signal received! Beginning operation...")
+                        break
+                time.sleep(0.1)
                 
-            elif cmd == "SET" and len(parts) >= 3:
-                param_name = parts[1]
-                param_value = float(parts[2])
-                self._update_parameter(param_name, param_value)
-                
-            elif cmd in ["0", "1"] and len(parts) >= 2:
-                pin_num = int(parts[1])
-                if pin_num in [5, 6]:
-                    value = GPIO.HIGH if cmd == "1" else GPIO.LOW
-                    GPIO.output(pin_num, value)
-                    logger.info(f"Manual GPIO {pin_num} set to {cmd}")
-                    
-        except Exception as e:
-            logger.error(f"Command processing error: {e}")
+        except serial.SerialException as e:
+            print(f"Failed to connect to Arduino: {e}")
+            print("Make sure Arduino is connected to /dev/ttyUSB0")
+            sys.exit(1)
     
-    def _update_parameter(self, param_name: str, value: float):
-        """Update system parameters"""
-        with self.param_lock:
-            if hasattr(self.parameters, param_name):
-                setattr(self.parameters, param_name, value)
-                logger.info(f"Parameter {param_name} updated to {value}")
-            else:
-                logger.warning(f"Unknown parameter: {param_name}")
-    
-    def _simulate_depth_sensor(self) -> float:
-        """Simulate depth sensor reading"""
-        # Simple simulation - replace with actual sensor code
-        import random
-        base_depth = 1000 + (time.time() % 100) * 10
-        noise = random.uniform(-20, 20)
-        return base_depth + noise
-    
-    def _depth_control_loop(self):
-        """Main depth control state machine"""
-        while self.running:
-            if not self.depth_control_active:
-                time.sleep(1)
-                continue
-                
-            # Read depth sensor every 5 seconds
-            self.current_depth = self._simulate_depth_sensor()
-            self._send_pressure_reading()
+    def read_sensor(self):
+        """Read sensor data and update current depth"""
+        if self.sensor.read():
+            self.current_depth = self.sensor.depth()
+            pressure = self.sensor.pressure()
+            temperature = self.sensor.temperature()
             
-            with self.state_lock:
-                self._update_state_machine()
+            # Display current readings
+            print(f"Depth: {self.current_depth:.2f}m | "
+                  f"Temp: {temperature:.2f}°C | "
+                  f"Pressure: {pressure:.2f}mbar")
             
-            time.sleep(5)
-    
-    def _update_state_machine(self):
-        """Update the depth control state machine"""
-        if self.state == DepthState.DESCENDING:
-            GPIO.output(5, GPIO.HIGH)
-            GPIO.output(6, GPIO.LOW)
-            
-            if self.current_depth >= self.parameters.depth_trigger:
-                self.state = DepthState.AT_DEPTH
-                self.at_depth_start_time = time.time()
-                logger.info("Reached depth trigger - both pins HIGH")
-                
-        elif self.state == DepthState.AT_DEPTH:
-            GPIO.output(5, GPIO.HIGH)
-            GPIO.output(6, GPIO.HIGH)
-            
-            if self.current_depth >= self.parameters.max_depth:
-                if self.at_depth_start_time is None:
-                    self.at_depth_start_time = time.time()
-                elif time.time() - self.at_depth_start_time >= 45:
-                    self.state = DepthState.OSCILLATING_DOWN
-                    self.at_depth_start_time = None
-                    logger.info("Max depth timeout - starting oscillation")
-                    
-        elif self.state == DepthState.OSCILLATING_DOWN:
-            GPIO.output(5, GPIO.HIGH)
-            GPIO.output(6, GPIO.LOW)
-            
-            if self._is_depth_stable():
-                self.state = DepthState.OSCILLATING_UP
-                logger.info("Depth stable - switching to oscillating up")
-                
-        elif self.state == DepthState.OSCILLATING_UP:
-            GPIO.output(5, GPIO.LOW)
-            GPIO.output(6, GPIO.HIGH)
-            
-            if not self._is_depth_stable():
-                self.state = DepthState.OSCILLATING_DOWN
-                self.stable_start_time = None
-                logger.info("Depth unstable - switching to oscillating down")
-    
-    def _is_depth_stable(self) -> bool:
-        """Check if depth is stable within threshold"""
-        # Simplified stability check - in real implementation, 
-        # you'd want to track depth history
-        if abs(self.current_depth - self.parameters.max_depth) <= self.parameters.stability_threshold:
-            if self.stable_start_time is None:
-                self.stable_start_time = time.time()
-            return (time.time() - self.stable_start_time) >= self.parameters.stability_duration
+            return True
         else:
-            self.stable_start_time = None
+            print("Failed to read sensor data!")
             return False
     
-    def _send_pressure_reading(self):
-        """Send pressure reading to A2"""
+    def send_depth_to_arduino(self):
+        """Send depth reading to Arduino"""
+        current_time = time.time()
+        
+        if current_time - self.last_depth_send_time >= DEPTH_SEND_INTERVAL:
+            message = f"DEPTH:{self.current_depth:.2f}\n"
+            try:
+                self.arduino.write(message.encode())
+                print(f"Sent to Arduino: {message.strip()}")
+                self.last_depth_send_time = current_time
+            except Exception as e:
+                print(f"Error sending to Arduino: {e}")
+    
+    def control_gpio_pins(self):
+        # Initialize state variables if they don't exist
+        if not hasattr(self, 'mission_state'):
+            self.mission_state = 'DESCENDING_TO_PAUSE'
+            self.prev_depth = self.current_depth
+            self.pause_timer = 0
+            self.max_depth = 0
+            self.depth_stable_count = 0
+            self.velocity_history = []
+        
+        # Calculate velocity (positive = descending, negative = ascending)
+        velocity = (self.current_depth - self.prev_depth) / 0.1  # m/s
+        self.velocity_history.append(velocity)
+        if len(self.velocity_history) > 10:  # Keep last 1 second of data
+            self.velocity_history.pop(0)
+        
+        avg_velocity = sum(self.velocity_history) / len(self.velocity_history)
+        self.prev_depth = self.current_depth
+        
+        # Update max depth for bottom detection
+        if self.current_depth > self.max_depth:
+            self.max_depth = self.current_depth
+            self.depth_stable_count = 0
+        else:
+            self.depth_stable_count += 1
+        
+        # State machine logic
+        if self.mission_state == 'DESCENDING_TO_PAUSE':
+            target_depth = 2.5
+            depth_error = target_depth - self.current_depth
+            
+            if abs(depth_error) <= 0.5:  # Within pause zone
+                self.mission_state = 'PAUSING'
+                self.pause_timer = 0
+            elif depth_error > 0:  # Need to descend more
+                if abs(avg_velocity) > 0.3 or depth_error < 0.5:  # Brake if too fast or close
+                    GPIO.output(5, GPIO.HIGH)
+                    GPIO.output(6, GPIO.HIGH)  # Neutral
+                else:
+                    GPIO.output(5, GPIO.HIGH)
+                    GPIO.output(6, GPIO.LOW)   # Increase density
+            else:  # Overshot, need to ascend slightly
+                GPIO.output(5, GPIO.LOW)
+                GPIO.output(6, GPIO.HIGH)      # Decrease density
+        
+        elif self.mission_state == 'PAUSING':
+            self.pause_timer += 100  # ms
+            depth_error = 2.5 - self.current_depth
+            
+            if self.pause_timer >= 60000:  # 60 seconds
+                self.mission_state = 'DESCENDING_TO_BOTTOM'
+            elif abs(depth_error) > 0.3:  # Tighter control band - start correcting at 0.3m
+                if depth_error > 0:  # Drifting too shallow
+                    GPIO.output(5, GPIO.HIGH)
+                    GPIO.output(6, GPIO.LOW)   # Increase density
+                else:  # Drifting too deep
+                    GPIO.output(5, GPIO.LOW)
+                    GPIO.output(6, GPIO.HIGH)  # Decrease density
+            elif abs(depth_error) > 0.1 and abs(avg_velocity) > 0.05:  # Gentle correction for drift
+                if depth_error > 0 and avg_velocity < 0:  # Rising too fast
+                    GPIO.output(5, GPIO.HIGH)
+                    GPIO.output(6, GPIO.LOW)   # Gentle increase density
+                elif depth_error < 0 and avg_velocity > 0:  # Sinking too fast
+                    GPIO.output(5, GPIO.LOW)
+                    GPIO.output(6, GPIO.HIGH)  # Gentle decrease density
+                else:
+                    GPIO.output(5, GPIO.HIGH)
+                    GPIO.output(6, GPIO.HIGH)  # Neutral
+            else:  # Stay neutral in pause zone
+                GPIO.output(5, GPIO.HIGH)
+                GPIO.output(6, GPIO.HIGH)      # Neutral
+        
+        elif self.mission_state == 'DESCENDING_TO_BOTTOM':
+            # Bottom detection: depth hasn't increased for 3 seconds
+            if self.depth_stable_count >= 30:  # 3 seconds at 100ms intervals
+                self.mission_state = 'ASCENDING'
+            elif abs(avg_velocity) > 0.4:  # Control descent speed
+                GPIO.output(5, GPIO.HIGH)
+                GPIO.output(6, GPIO.HIGH)      # Neutral/brake
+            else:
+                GPIO.output(5, GPIO.HIGH)
+                GPIO.output(6, GPIO.LOW)       # Increase density
+        
+        elif self.mission_state == 'ASCENDING':
+            # Surface detection: depth very small or stopped ascending
+            if self.current_depth <= 0.2:  # Near surface
+                self.mission_state = 'AT_SURFACE'
+                GPIO.output(5, GPIO.HIGH)
+                GPIO.output(6, GPIO.HIGH)      # Neutral
+            elif abs(avg_velocity) > 0.4:  # Control ascent speed
+                GPIO.output(5, GPIO.HIGH)
+                GPIO.output(6, GPIO.HIGH)      # Neutral/brake
+            else:
+                GPIO.output(5, GPIO.LOW)
+                GPIO.output(6, GPIO.HIGH)      # Decrease density
+        
+        elif self.mission_state == 'AT_SURFACE':
+            # Mission complete - maintain neutral buoyancy
+            GPIO.output(5, GPIO.HIGH)
+            GPIO.output(6, GPIO.HIGH)          # Neutral
+
+
+        
+    
+    def listen_to_arduino(self):
+        """Listen for messages from Arduino (runs in separate thread)"""
+        while True:
+            try:
+                if self.arduino.in_waiting > 0:
+                    message = self.arduino.readline().decode().strip()
+                    if message:
+                        print(f"Arduino says: {message}")
+            except Exception as e:
+                print(f"Error reading from Arduino: {e}")
+            time.sleep(0.1)
+    
+    def run(self):
+        """Main program loop"""
+        print("Starting depth sensor controller...")
+        print(f"Sending depth to Arduino every {DEPTH_SEND_INTERVAL} seconds")
+        print("Press Ctrl+C to exit")
+        print("-" * 60)
+        
+        # Start Arduino listener in separate thread
+        arduino_thread = Thread(target=self.listen_to_arduino, daemon=True)
+        arduino_thread.start()
+
+        GPIO.output(GPIO_PIN_5, GPIO.LOW)
+        self.gpio_state["pin5"] = False
+        
         try:
-            self.sequence_number += 1
-            message = f"PRESSURE:{self.sequence_number}:{self.current_depth:.2f}\n"
-            self.uart.write(message.encode('utf-8'))
-            logger.debug(f"Sent pressure reading: {self.current_depth:.2f} mbar")
-        except Exception as e:
-            logger.error(f"Failed to send pressure reading: {e}")
+            while True:
+                # Read sensor data
+                if self.read_sensor():
+                    # Control GPIO pins based on depth
+                    self.control_gpio_pins()
+                    
+                    # Send depth to Arduino (if interval elapsed)
+                    self.send_depth_to_arduino()
+                
+                time.sleep(SENSOR_READ_INTERVAL)
+                
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            self.cleanup()
     
     def cleanup(self):
-        """Cleanup resources"""
-        self.running = False
+        """Clean up resources"""
+        # Turn off all GPIO pins
+        GPIO.output(GPIO_PIN_5, GPIO.LOW)
+        GPIO.output(GPIO_PIN_6, GPIO.LOW)
         GPIO.cleanup()
-        self.uart.close()
+        
+        # Close Arduino connection
+        if self.arduino:
+            self.arduino.close()
+        
+        print("Cleanup completed. Goodbye!")
+
+def main():
+    controller = DepthSensorController()
+    controller.run()
 
 if __name__ == "__main__":
-    controller = DepthController()
-    try:
-        controller.start()
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    finally:
-        controller.cleanup()
+    main()
