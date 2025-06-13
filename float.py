@@ -11,6 +11,7 @@ import sys
 import RPi.GPIO as GPIO
 from threading import Thread
 import queue
+import smbus
 
 # Configuration
 ARDUINO_PORT = "/dev/ttyUSB0"
@@ -283,7 +284,25 @@ class DepthSensorController:
         
         print("Cleanup completed. Goodbye!")
 
+def reset_bar30():
+    bus = smbus.SMBus(1)
+    for attempt in range(5):  # Try up to 5 times
+        try:
+            bus.write_byte(0x76, 0x1E)  # Reset command
+            time.sleep(0.1)
+            
+            # Verify reset worked by reading PROM
+            data = bus.read_word_data(0x76, 0xA0)
+            if data != 0x0000 and data != 0xFFFF:
+                return True
+        except:
+            time.sleep(0.2)  # Wait longer between attempts
+    return False
+
 def main():
+    reset_bar30()
+    time.sleep(5)
+
     controller = DepthSensorController()
     controller.run()
 

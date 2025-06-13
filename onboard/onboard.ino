@@ -145,6 +145,9 @@ void handleActiveState() {
         Serial.println("ERROR: Queue full! Message dropped.");
         totalMessagesDropped++;
       }
+    }else{
+      Serial.print("unknown command: ");
+      Serial.println(incomingData);
     }
   }
   
