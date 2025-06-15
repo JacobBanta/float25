@@ -127,6 +127,24 @@ void handleSerialCommands() {
     
     if (command.equalsIgnoreCase("START")) {
       handleStartCommand();
+    } else if (command.equalsIgnoreCase("STOP")) {
+      if (sendMessageToA2("STOP")) {
+        Serial.println("INFO:STOP signal sent successfully");
+      }else{
+        Serial.println("INFO:Failed to send STOP signal to A2");
+      }
+    } else if (command.equalsIgnoreCase("INTAKE")) {
+      if (sendMessageToA2("INTAKE")) {
+        Serial.println("INFO:INTAKE signal sent successfully");
+      }else{
+        Serial.println("INFO:Failed to send INTAKE signal to A2");
+      }
+    } else if (command.equalsIgnoreCase("EXPEL")) {
+      if (sendMessageToA2("EXPEL")) {
+        Serial.println("INFO:EXPEL signal sent successfully");
+      }else{
+        Serial.println("INFO:Failed to send EXPEL signal to A2");
+      }
     } else if (command.equalsIgnoreCase("STATUS")) {
       printStatus();
     } else if (command.equalsIgnoreCase("RESET")) {

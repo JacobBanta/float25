@@ -23,6 +23,11 @@ SENSOR_READ_INTERVAL = 0.1  # Read sensor every 100ms
 GPIO_PIN_5 = 5
 GPIO_PIN_6 = 6
 
+# Parameters
+speed = 0.2
+start_stopping = 0.5 # how far above 2.5m it will start slowing down
+take_in_water_time = 150 / SENSOR_READ_INTERVAL
+
 class DepthSensorController:
     def __init__(self):
         self.sensor = None
@@ -88,6 +93,15 @@ class DepthSensorController:
                     if message == "START":
                         print("START signal received! Beginning operation...")
                         break
+                    if message == "INTAKE":
+                        GPIO.output(5, GPIO.HIGH)
+                        GPIO.output(6, GPIO.LOW)   # Increase density
+                    if message == "EXPEL":
+                        GPIO.output(6, GPIO.HIGH)
+                        GPIO.output(5, GPIO.LOW)   # Decrease density
+                    if message == "STOP":
+                        GPIO.output(6, GPIO.HIGH)
+                        GPIO.output(5, GPIO.HIGH)
                 time.sleep(0.1)
                 
         except serial.SerialException as e:
@@ -117,7 +131,7 @@ class DepthSensorController:
         current_time = time.time()
         
         if current_time - self.last_depth_send_time >= DEPTH_SEND_INTERVAL:
-            message = f"DEPTH:{self.current_depth:.2f}\n"
+            message = f"DEPTH:{self.current_depth:.4f}\n"
             try:
                 self.arduino.write(message.encode())
                 print(f"Sent to Arduino: {message.strip()}")
@@ -127,13 +141,16 @@ class DepthSensorController:
     
     def control_gpio_pins(self):
         # Initialize state variables if they don't exist
-        if not hasattr(self, 'mission_state'):
+        if not hasattr(self, "mission_state"):
             self.mission_state = 'DESCENDING_TO_PAUSE'
             self.prev_depth = self.current_depth
             self.pause_timer = 0
             self.max_depth = 0
             self.depth_stable_count = 0
             self.velocity_history = []
+            self.down_time = 0
+        if self.down_time > take_in_water_time:
+            return
         
         # Calculate velocity (positive = descending, negative = ascending)
         velocity = (self.current_depth - self.prev_depth) / 0.1  # m/s
@@ -156,40 +173,49 @@ class DepthSensorController:
             target_depth = 2.5
             depth_error = target_depth - self.current_depth
             
-            if abs(depth_error) <= 0.5:  # Within pause zone
+            if abs(depth_error) <= 0.3:  # Within pause zone
                 self.mission_state = 'PAUSING'
                 self.pause_timer = 0
             elif depth_error > 0:  # Need to descend more
-                if abs(avg_velocity) > 0.3 or depth_error < 0.5:  # Brake if too fast or close
+                if abs(avg_velocity) > speed or depth_error < start_stopping:  # Brake if too fast or close
                     GPIO.output(5, GPIO.HIGH)
                     GPIO.output(6, GPIO.HIGH)  # Neutral
                 else:
                     GPIO.output(5, GPIO.HIGH)
                     GPIO.output(6, GPIO.LOW)   # Increase density
+                    self.down_time += 1
             else:  # Overshot, need to ascend slightly
                 GPIO.output(5, GPIO.LOW)
                 GPIO.output(6, GPIO.HIGH)      # Decrease density
+                self.down_time -= 1
         
         elif self.mission_state == 'PAUSING':
             self.pause_timer += 100  # ms
             depth_error = 2.5 - self.current_depth
+            if abs(depth_error) > 0.5:
+                self.pause_timer = 0
             
             if self.pause_timer >= 60000:  # 60 seconds
                 self.mission_state = 'DESCENDING_TO_BOTTOM'
+                self.pause_timer = 0
             elif abs(depth_error) > 0.3:  # Tighter control band - start correcting at 0.3m
                 if depth_error > 0:  # Drifting too shallow
                     GPIO.output(5, GPIO.HIGH)
                     GPIO.output(6, GPIO.LOW)   # Increase density
+                    self.down_time += 1
                 else:  # Drifting too deep
                     GPIO.output(5, GPIO.LOW)
                     GPIO.output(6, GPIO.HIGH)  # Decrease density
+                    self.down_time -= 1
             elif abs(depth_error) > 0.1 and abs(avg_velocity) > 0.05:  # Gentle correction for drift
                 if depth_error > 0 and avg_velocity < 0:  # Rising too fast
                     GPIO.output(5, GPIO.HIGH)
                     GPIO.output(6, GPIO.LOW)   # Gentle increase density
+                    self.down_time += 1
                 elif depth_error < 0 and avg_velocity > 0:  # Sinking too fast
                     GPIO.output(5, GPIO.LOW)
                     GPIO.output(6, GPIO.HIGH)  # Gentle decrease density
+                    self.down_time -= 1
                 else:
                     GPIO.output(5, GPIO.HIGH)
                     GPIO.output(6, GPIO.HIGH)  # Neutral
@@ -201,16 +227,17 @@ class DepthSensorController:
             # Bottom detection: depth hasn't increased for 3 seconds
             if self.depth_stable_count >= 30:  # 3 seconds at 100ms intervals
                 self.mission_state = 'ASCENDING'
-            elif abs(avg_velocity) > 0.4:  # Control descent speed
+            elif abs(avg_velocity) > speed:  # Control descent speed
                 GPIO.output(5, GPIO.HIGH)
                 GPIO.output(6, GPIO.HIGH)      # Neutral/brake
             else:
                 GPIO.output(5, GPIO.HIGH)
                 GPIO.output(6, GPIO.LOW)       # Increase density
+                self.down_time += 1
         
         elif self.mission_state == 'ASCENDING':
             # Surface detection: depth very small or stopped ascending
-            if self.current_depth <= 0.2:  # Near surface
+            if self.current_depth <= 0.1:  # Near surface
                 self.mission_state = 'AT_SURFACE'
                 GPIO.output(5, GPIO.HIGH)
                 GPIO.output(6, GPIO.HIGH)      # Neutral
@@ -220,11 +247,16 @@ class DepthSensorController:
             else:
                 GPIO.output(5, GPIO.LOW)
                 GPIO.output(6, GPIO.HIGH)      # Decrease density
+                self.down_time -= 1
         
         elif self.mission_state == 'AT_SURFACE':
             # Mission complete - maintain neutral buoyancy
             GPIO.output(5, GPIO.HIGH)
             GPIO.output(6, GPIO.HIGH)          # Neutral
+            self.pause_timer += 100
+            if self.pause_timer > 30000:
+                self.pause_timer = 0
+                self.mission_state = 'DESCENDING_TO_PAUSE'
 
 
         

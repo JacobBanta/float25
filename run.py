@@ -52,7 +52,7 @@ class ArduinoDataLogger:
         
         # Baud rate
         ttk.Label(conn_frame, text="Baud:").grid(row=0, column=2, sticky=tk.W, padx=(20, 0))
-        self.baud_var = tk.StringVar(value="115200")
+        self.baud_var = tk.StringVar(value="9600")
         baud_combo = ttk.Combobox(conn_frame, textvariable=self.baud_var, width=10,
                                   values=["9600", "19200", "38400", "57600", "115200"])
         baud_combo.grid(row=0, column=3, padx=(5, 0))
@@ -127,6 +127,8 @@ class ArduinoDataLogger:
         if port_list:
             if "/dev/ttyUSB0" in port_list:
                 self.port_combo.set("/dev/ttyUSB0")
+            elif "COM3" in port_list and len(port_list) >= 2:
+                self.port_combo.set(port_list[1])
             else:
                 self.port_combo.set(port_list[0])
     

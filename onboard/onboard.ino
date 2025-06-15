@@ -121,6 +121,15 @@ void handleWaitingForStart() {
       Serial.println("System activated - Now accepting depth data from RPi");
       printStatus();
     }
+    if (message == "EXPEL") {
+      Serial.println("EXPEL");
+    }
+    if (message == "INTAKE") {
+      Serial.println("INTAKE");
+    }
+    if (message == "STOP") {
+      Serial.println("STOP");
+    }
   }
 }
 
